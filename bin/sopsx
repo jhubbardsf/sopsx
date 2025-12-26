@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+
+# SOPS wrapper that automatically sets AWS_PROFILE based on KMS keys
+# Dynamically finds the best profile from ~/.aws/config based on account ID
+# Project-agnostic: extracts account from .sops.yaml or encrypted files
+# Works with git textconv for `git diff` on encrypted files
+# Usage: sopsx [sops-arguments...]
+#
+# Debug mode: SOPSX_DEBUG=1 sopsx [args...]
+
+VERSION="1.0.0"
+
+# Show help
+show_help() {
+    cat << 'EOF'
+sopsx - SOPS wrapper that automatically sets AWS_PROFILE based on KMS keys
+
+USAGE:
+    sopsx [sops-arguments...]
+    sopsx <command>
+
+COMMANDS:
+    help, --help, -h       Show this help message
+    version, --version     Show version information
+
+DESCRIPTION:
+    sopsx wraps the `sops` command and automatically determines the correct
+    AWS_PROFILE based on KMS key ARNs found in:
+
+    1. The encrypted file itself (SOPS metadata contains the KMS ARN)
+    2. The .sops.yaml configuration file (matches file path to KMS key)
+
+    It parses your ~/.aws/config to find the best SSO profile for the
+    account ID extracted from the KMS ARN, preferring roles with higher
+    privileges (AdministratorAccess > PowerUserAccess > ReadOnlyAccess).
+
+EXAMPLES:
+    # Decrypt a file (profile auto-detected from file's KMS metadata)
+    sopsx -d secrets.enc.yaml
+
+    # Edit an encrypted file
+    sopsx secrets.enc.yaml
+
+    # Encrypt a new file (uses .sops.yaml to determine KMS key)
+    sopsx -e secrets.yaml > secrets.enc.yaml
+
+    # Use with git diff (configure in .gitattributes)
+    # *.enc.yaml diff=sopsdiffer
+
+    # Debug mode - see profile detection logic
+    SOPSX_DEBUG=1 sopsx -d secrets.enc.yaml
+
+GIT INTEGRATION:
+    Add to .gitconfig for readable diffs of encrypted files:
+
+    [diff "sopsdiffer"]
+        textconv = sopsx -d
+
+    Add to .gitattributes:
+
+    *.enc.yaml diff=sopsdiffer
+    *.enc.json diff=sopsdiffer
+
+ENVIRONMENT:
+    SOPSX_DEBUG=1          Enable debug output to stderr
+    AWS_CONFIG_FILE        Override default ~/.aws/config location
+
+ROLE PRIORITY:
+    When multiple profiles match an account, sopsx prefers:
+    1. AdministratorAccess (priority 100)
+    2. PowerUserAccess (priority 50)
+    3. DeveloperAccess / DevResourceAccess (priority 30)
+    4. ReadOnlyAccess (priority 10)
+    5. Other roles (priority 0)
+
+EOF
+}
+
+# Show version
+show_version() {
+    echo "sopsx version $VERSION"
+}
+
+# Handle help and version commands
+case "${1:-}" in
+    help|--help|-h)
+        show_help
+        exit 0
+        ;;
+    version|--version)
+        show_version
+        exit 0
+        ;;
+esac
+
+# Debug logging helper
+debug() {
+    if [[ "${SOPSX_DEBUG}" == "1" ]]; then
+        echo "[sopsx debug] $*" >&2
+    fi
+}
+
+# Function to find the best profile for an AWS account from ~/.aws/config
+find_profile_for_account() {
+    local account_id="$1"
+    local config_file="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+
+    if [[ ! -f "$config_file" ]]; then
+        return 1
+    fi
+
+    # Priority order for roles (higher number = higher priority)
+    declare -A role_priority=(
+        ["AdministratorAccess"]=100
+        ["PowerUserAccess"]=50
+        ["DeveloperAccess"]=30
+        ["DevResourceAccess"]=30
+        ["ReadOnlyAccess"]=10
+    )
+
+    local best_profile=""
+    local best_priority=0
+
+    # Parse AWS config to find profiles for this account
+    local current_profile=""
+    local current_account=""
+    local current_role=""
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\[profile\ (.+)\] ]]; then
+            # New profile section - check if previous profile matches
+            if [[ -n "$current_profile" && "$current_account" == "$account_id" ]]; then
+                local priority=${role_priority[$current_role]:-0}
+                if (( priority > best_priority )); then
+                    best_profile="$current_profile"
+                    best_priority=$priority
+                fi
+            fi
+            # Reset for new profile
+            current_profile="${BASH_REMATCH[1]}"
+            current_account=""
+            current_role=""
+        elif [[ "$line" =~ ^sso_account_id\ *=\ *(.+) ]]; then
+            current_account="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^sso_role_name\ *=\ *(.+) ]]; then
+            current_role="${BASH_REMATCH[1]}"
+        fi
+    done < "$config_file"
+
+    # Check the last profile in file
+    if [[ -n "$current_profile" && "$current_account" == "$account_id" ]]; then
+        local priority=${role_priority[$current_role]:-0}
+        if (( priority > best_priority )); then
+            best_profile="$current_profile"
+            best_priority=$priority
+        fi
+    fi
+
+    if [[ -n "$best_profile" ]]; then
+        echo "$best_profile"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to find .sops.yaml file in current or parent directories
+find_sops_config() {
+    local dir="$1"
+
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/.sops.yaml" ]]; then
+            echo "$dir/.sops.yaml"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+
+    return 1
+}
+
+# Function to extract KMS ARN from .sops.yaml for a given file path
+get_kms_from_sops_config() {
+    local sops_config="$1"
+    local file_path="$2"
+
+    # Get relative path from .sops.yaml directory
+    local sops_dir=$(dirname "$sops_config")
+    local rel_path=$(realpath --relative-to="$sops_dir" "$file_path" 2>/dev/null || echo "$file_path")
+
+    # Parse .sops.yaml to find matching path_regex and extract KMS ARN
+    local in_creation_rules=false
+    local current_kms=""
+    local current_regex=""
+
+    while IFS= read -r line; do
+        # Check if we're in creation_rules section
+        if [[ "$line" =~ ^creation_rules: ]]; then
+            in_creation_rules=true
+            continue
+        fi
+
+        # Skip if not in creation_rules
+        if [[ "$in_creation_rules" == false ]]; then
+            continue
+        fi
+
+        # Extract path_regex
+        if [[ "$line" =~ path_regex:\ *\"?([^\"]+)\"? ]] || [[ "$line" =~ path_regex:\ *([^\ ]+) ]]; then
+            current_regex="${BASH_REMATCH[1]}"
+        fi
+
+        # Extract kms ARN
+        if [[ "$line" =~ kms:\ *\"?(arn:aws:kms:[^\"]+)\"? ]]; then
+            current_kms="${BASH_REMATCH[1]}"
+
+            # Check if current regex matches our file
+            if [[ -n "$current_regex" ]] && [[ "$rel_path" =~ $current_regex ]]; then
+                echo "$current_kms"
+                return 0
+            fi
+        fi
+    done < "$sops_config"
+
+    return 1
+}
+
+# Function to extract account ID from KMS ARN
+extract_account_from_kms() {
+    local kms_arn="$1"
+
+    # Format: arn:aws:kms:region:ACCOUNT:key/xxx
+    if [[ "$kms_arn" =~ :([0-9]{12}): ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    return 1
+}
+
+# Function to extract KMS ARN from SOPS-encrypted file content
+# More robust extraction that handles various SOPS formats
+extract_kms_from_file() {
+    local file_path="$1"
+
+    # Try multiple patterns to find KMS ARN
+    # Pattern 1: Direct grep for ARN (works for both JSON and YAML)
+    local kms_arn=$(grep -oE 'arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+' "$file_path" 2>/dev/null | head -1)
+
+    if [[ -n "$kms_arn" ]]; then
+        echo "$kms_arn"
+        return 0
+    fi
+
+    # Pattern 2: Look for quoted ARN (JSON format)
+    kms_arn=$(grep -oE '"arn:aws:kms:[^"]+"' "$file_path" 2>/dev/null | head -1 | tr -d '"')
+
+    if [[ -n "$kms_arn" ]]; then
+        echo "$kms_arn"
+        return 0
+    fi
+
+    return 1
+}
+
+# Get the current working directory and all arguments
+current_dir="$(pwd)"
+account_id=""
+profile=""
+
+debug "sopsx called with args: $*"
+debug "Current directory: $current_dir"
+
+# Strategy 1: Try to get account from encrypted file (if file exists and is encrypted)
+file_path=""
+for arg in "$@"; do
+    if [[ -f "$arg" ]]; then
+        file_path="$arg"
+        debug "Found file argument: $file_path"
+        break
+    fi
+done
+
+if [[ -n "$file_path" ]]; then
+    debug "Strategy 1: Extracting KMS from encrypted file"
+
+    # Check if file has SOPS metadata
+    if grep -q 'sops:' "$file_path" 2>/dev/null || grep -q 'sops_version' "$file_path" 2>/dev/null; then
+        debug "File appears to have SOPS metadata"
+
+        # Try to extract KMS ARN from SOPS-encrypted file using robust extraction
+        kms_arn=$(extract_kms_from_file "$file_path")
+
+        if [[ -n "$kms_arn" ]]; then
+            debug "Found KMS ARN in file: $kms_arn"
+            account_id=$(extract_account_from_kms "$kms_arn")
+            if [[ -n "$account_id" ]]; then
+                debug "Extracted account ID: $account_id"
+                profile=$(find_profile_for_account "$account_id")
+
+                if [[ -n "$profile" ]]; then
+                    # Success! Export and execute
+                    debug "Using AWS profile: $profile"
+                    export AWS_PROFILE="$profile"
+                    exec sops "$@"
+                else
+                    debug "No AWS profile found for account $account_id"
+                fi
+            else
+                debug "Could not extract account ID from KMS ARN"
+            fi
+        else
+            debug "File has SOPS metadata but no KMS ARN found"
+        fi
+    else
+        # File is not encrypted - check if this is a decrypt operation for git textconv
+        if [[ "$*" == *"-d"* ]] || [[ "$*" == *"--decrypt"* ]]; then
+            debug "File is not encrypted, but decrypt requested (likely git textconv)"
+            debug "Passing through file content as-is"
+            cat "$file_path"
+            exit 0
+        fi
+        debug "No SOPS metadata found in file"
+    fi
+
+    # Strategy 2: File exists but not encrypted - check .sops.yaml
+    debug "Strategy 2: Looking for .sops.yaml relative to file"
+    sops_config=$(find_sops_config "$(dirname "$(realpath "$file_path")")")
+
+    if [[ -n "$sops_config" ]]; then
+        debug "Found .sops.yaml: $sops_config"
+        kms_arn=$(get_kms_from_sops_config "$sops_config" "$file_path")
+
+        if [[ -n "$kms_arn" ]]; then
+            debug "Found KMS ARN in .sops.yaml: $kms_arn"
+            account_id=$(extract_account_from_kms "$kms_arn")
+
+            if [[ -n "$account_id" ]]; then
+                debug "Extracted account ID: $account_id"
+                profile=$(find_profile_for_account "$account_id")
+
+                if [[ -n "$profile" ]]; then
+                    # Success! Export and execute
+                    debug "Using AWS profile: $profile"
+                    export AWS_PROFILE="$profile"
+                    exec sops "$@"
+                else
+                    echo "Error: No AWS profile found for account $account_id" >&2
+                    echo "  (from KMS: $kms_arn in $sops_config)" >&2
+                    exit 1
+                fi
+            else
+                echo "Error: Could not extract account ID from KMS ARN: $kms_arn" >&2
+                exit 1
+            fi
+        else
+            echo "Error: Could not find matching KMS key in $sops_config for file: $file_path" >&2
+            exit 1
+        fi
+    else
+        debug "No .sops.yaml found relative to file"
+    fi
+fi
+
+# Strategy 3: No file specified - look for .sops.yaml in current directory
+debug "Strategy 3: Looking for .sops.yaml in current directory"
+sops_config=$(find_sops_config "$current_dir")
+
+if [[ -n "$sops_config" ]]; then
+    debug "Found .sops.yaml: $sops_config"
+    # Extract first KMS ARN as fallback
+    kms_arn=$(grep -o 'arn:aws:kms:[^"]*' "$sops_config" 2>/dev/null | head -1)
+
+    if [[ -n "$kms_arn" ]]; then
+        debug "Found KMS ARN in .sops.yaml: $kms_arn"
+        account_id=$(extract_account_from_kms "$kms_arn")
+
+        if [[ -n "$account_id" ]]; then
+            debug "Extracted account ID: $account_id"
+            profile=$(find_profile_for_account "$account_id")
+
+            if [[ -n "$profile" ]]; then
+                # Success! Export and execute
+                debug "Using AWS profile: $profile"
+                export AWS_PROFILE="$profile"
+                exec sops "$@"
+            else
+                echo "Error: No AWS profile found for account $account_id" >&2
+                echo "  (from first KMS in $sops_config)" >&2
+                exit 1
+            fi
+        else
+            debug "Could not extract account ID from KMS ARN"
+        fi
+    else
+        debug "No KMS ARN found in .sops.yaml"
+    fi
+else
+    debug "No .sops.yaml found in current directory"
+fi
+
+# If we get here, we couldn't determine the account
+echo "Error: Could not determine AWS account ID" >&2
+echo "" >&2
+echo "Tried:" >&2
+if [[ -n "$file_path" ]]; then
+    echo "  1. Extract from encrypted file: $file_path" >&2
+    echo "  2. Match file path in .sops.yaml" >&2
+else
+    echo "  1. No file specified in arguments" >&2
+fi
+echo "  3. Find .sops.yaml in current directory: $(pwd)" >&2
+echo "" >&2
+echo "Suggestions:" >&2
+echo "  - Specify a SOPS-encrypted file to operate on" >&2
+echo "  - Run from a directory containing .sops.yaml" >&2
+echo "  - Set AWS_PROFILE manually: AWS_PROFILE=name sops ..." >&2
+echo "  - Enable debug mode: SOPSX_DEBUG=1 sopsx ..." >&2
+exit 1
