@@ -177,6 +177,26 @@
             color: var(--accent);
         }
 
+        .comparison-card .diff-header {
+            color: #60a5fa;
+        }
+
+        .comparison-card .diff-remove {
+            color: #f87171;
+        }
+
+        .comparison-card .diff-add {
+            color: #4ade80;
+        }
+
+        .comparison-card .prompt {
+            color: var(--accent);
+        }
+
+        .git-diff-section {
+            padding-top: 40px;
+        }
+
         /* Terminal Demo */
         .demo {
             padding: 60px 0;
@@ -414,6 +434,45 @@ sopsx -d prod/secrets.enc.yaml
                     <div class="output">database_password: supersecret123</div>
                     <div class="output">api_key: sk-live-xxxxx</div>
                 </div>
+            </div>
+        </section>
+
+        <!-- Git Diff Demo -->
+        <section class="comparison git-diff-section">
+            <h2 style="text-align: center; font-size: 1.5rem; margin-bottom: 32px;">Readable git diffs</h2>
+            <p style="text-align: center; color: var(--text-secondary); margin-bottom: 32px; max-width: 600px; margin-left: auto; margin-right: auto;">
+                Configure sopsx as a git textconv and see actual changes instead of encrypted noise.
+            </p>
+            <div class="comparison-grid">
+                <div class="comparison-card before">
+                    <h3>Before: Encrypted Gibberish</h3>
+                    <pre><code><span class="prompt">$</span> git diff secrets.enc.yaml
+
+<span class="diff-header">diff --git a/secrets.enc.yaml</span>
+<span class="diff-remove">-api_key: ENC[AES256_GCM,data:x8kP...</span>
+<span class="diff-remove">-db_pass: ENC[AES256_GCM,data:9mNq...</span>
+<span class="diff-add">+api_key: ENC[AES256_GCM,data:7jLw...</span>
+<span class="diff-add">+db_pass: ENC[AES256_GCM,data:4xRt...</span>
+
+<span class="comment"># What actually changed? No idea.</span></code></pre>
+                </div>
+                <div class="comparison-card after">
+                    <h3>After: With sopsx textconv</h3>
+                    <pre><code><span class="prompt">$</span> git diff secrets.enc.yaml
+
+<span class="diff-header">diff --git a/secrets.enc.yaml</span>
+<span class="diff-remove">-api_key: sk-live-old-key-abc123</span>
+<span class="diff-remove">-db_pass: hunter2</span>
+<span class="diff-add">+api_key: sk-live-new-key-xyz789</span>
+<span class="diff-add">+db_pass: correct-horse-battery</span>
+
+<span class="comment"># Ah, API key rotated. Makes sense.</span></code></pre>
+                </div>
+            </div>
+            <div style="text-align: center; margin-top: 24px;">
+                <code style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--text-muted); background: var(--code-bg); padding: 8px 16px; border-radius: 6px;">
+                    ~/.gitconfig: [diff "sopsdiffer"] textconv = sopsx -d
+                </code>
             </div>
         </section>
 
